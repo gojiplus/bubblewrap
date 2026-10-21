@@ -146,6 +146,8 @@ export class FilesystemSandbox {
       else args.push('--ro-bind', '/dev/null', path);
     }
 
+    args.push('--remount-ro', '/');
+
     // Set working directory
     const cwd = options.cwd || this.config.workingDir;
     args.push('--chdir', cwd);
