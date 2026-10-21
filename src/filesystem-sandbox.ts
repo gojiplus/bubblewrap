@@ -3,24 +3,12 @@
  */
 
 import { spawn } from 'child_process';
+import { existsSync, statSync } from 'fs';
+import { isWithinPath } from './path-access.js';
 import { SandboxConfig, CommandResult, ExecuteOptions } from './types.js';
 
 export class FilesystemSandbox {
-  private useDirectExecution: boolean = false;
-
-  constructor(private config: SandboxConfig) {
-    // In CI environments without user namespace support, we can't use bubblewrap's
-    // mount isolation features. Fall back to direct execution WITHOUT sandboxing.
-    const isCI = process.env.CI === 'true' || process.env.GITHUB_ACTIONS === 'true';
-    if (isCI) {
-      // GitHub Actions and similar CI environments typically don't support user namespaces
-      // which are required for bubblewrap's bind mounts. Use direct execution instead.
-      this.useDirectExecution = true;
-      console.warn('⚠️  CI environment detected - bubblewrap sandboxing is DISABLED');
-      console.warn('⚠️  Commands will run with full filesystem access');
-      console.warn('⚠️  For secure sandboxing in CI, use Docker or similar containerization');
-    }
-  }
+  constructor(private config: SandboxConfig) {}
 
   /**
    * Execute a command inside bubblewrap sandbox
@@ -30,11 +18,6 @@ export class FilesystemSandbox {
     options: ExecuteOptions = {}
   ): Promise<CommandResult> {
     const startTime = Date.now();
-
-    // If direct execution mode, run command directly without bubblewrap
-    if (this.useDirectExecution) {
-      return this.executeDirectly(command, options, startTime);
-    }
 
     const bwrapArgs = this.buildBubblewrapArgs(command, options);
 
@@ -56,60 +39,6 @@ export class FilesystemSandbox {
 
       proc.on('error', (error) => {
         reject(new Error(`Failed to spawn bubblewrap: ${error.message}`));
-      });
-
-      proc.on('close', (code) => {
-        const duration = Date.now() - startTime;
-        resolve({
-          exitCode: code ?? 1,
-          stdout,
-          stderr,
-          duration,
-        });
-      });
-
-      // Handle timeout
-      if (options.timeout) {
-        setTimeout(() => {
-          proc.kill('SIGTERM');
-          setTimeout(() => proc.kill('SIGKILL'), 5000);
-        }, options.timeout);
-      }
-    });
-  }
-
-  /**
-   * Execute command directly without bubblewrap (for CI environments)
-   *
-   * WARNING: This mode does NOT provide security sandboxing.
-   * Commands run with full access to the filesystem.
-   * For secure sandboxing in CI, use Docker or similar containerization.
-   */
-  private executeDirectly(
-    command: string[],
-    options: ExecuteOptions,
-    startTime: number
-  ): Promise<CommandResult> {
-    return new Promise((resolve, reject) => {
-      const [cmd, ...args] = command;
-      const proc = spawn(cmd, args, {
-        env: options.env || process.env,
-        cwd: options.cwd || this.config.workingDir,
-      });
-
-      let stdout = '';
-      let stderr = '';
-
-      proc.stdout?.on('data', (data) => {
-        stdout += data.toString();
-      });
-
-      proc.stderr?.on('data', (data) => {
-        stderr += data.toString();
-      });
-
-      proc.on('error', (error) => {
-        reject(new Error(`Failed to spawn command: ${error.message}`));
       });
 
       proc.on('close', (code) => {
@@ -173,8 +102,8 @@ export class FilesystemSandbox {
         return `'${escaped}'`;
       }).join(' ');
 
-      const wrappedCommand = `${ulimitCommands.join('; ')}; exec ${commandStr}`;
-      return ['sh', '-c', wrappedCommand];
+      const wrappedCommand = `${ulimitCommands.join(' && ')} && exec ${commandStr}`;
+      return ['/bin/bash', '-c', wrappedCommand];
     }
 
     return command;
@@ -187,35 +116,10 @@ export class FilesystemSandbox {
     command: string[],
     options: ExecuteOptions
   ): string[] {
-    const isCI = process.env.CI === 'true' || process.env.GITHUB_ACTIONS === 'true';
-
-    const args: string[] = [];
-
-    // In CI environments, user namespaces may not be available
-    // Skip namespace isolation entirely and just use bind mounts
-    if (!isCI) {
-      // Full isolation with user namespaces (only when not in CI)
-      args.push('--unshare-all', '--share-net');
-
-      args.push(
-        // Kill sandbox if parent dies
-        '--die-with-parent',
-
-        // Set up /proc and /dev
-        '--proc',
-        '/proc',
-        '--dev',
-        '/dev',
-
-        // Create tmpfs for /tmp
-        '--tmpfs',
-        this.config.tmpDir
-      );
-    } else {
-      // CI mode: This code path shouldn't be reached when useDirectExecution is true
-      // But keeping a minimal config as fallback
-      args.push('--die-with-parent');
-    }
+    const args: string[] = [
+      '--unshare-all', '--share-net', '--die-with-parent',
+      '--proc', '/proc', '--dev', '/dev', '--tmpfs', this.config.tmpDir,
+    ];
 
     // Add read-only binds for system paths
     for (const path of this.config.allowedReadPaths) {
@@ -232,6 +136,15 @@ export class FilesystemSandbox {
     // Bind resolv.conf for DNS (read-only)
     args.push('--ro-bind-try', '/etc/resolv.conf', '/etc/resolv.conf');
     args.push('--ro-bind-try', '/etc/hosts', '/etc/hosts');
+
+    for (const path of this.config.deniedPaths) {
+      if (!existsSync(path)) continue;
+      const exposed = [...this.config.allowedReadPaths, ...this.config.allowedWritePaths]
+        .some((allowed) => isWithinPath(path, allowed));
+      if (!exposed) continue;
+      if (statSync(path).isDirectory()) args.push('--tmpfs', path, '--remount-ro', path);
+      else args.push('--ro-bind', '/dev/null', path);
+    }
 
     // Set working directory
     const cwd = options.cwd || this.config.workingDir;
@@ -251,7 +164,7 @@ export class FilesystemSandbox {
    */
   static async isAvailable(): Promise<boolean> {
     return new Promise((resolve) => {
-      const proc = spawn('which', ['bwrap']);
+      const proc = spawn('bwrap', ['--unshare-all', '--ro-bind', '/', '/', '/bin/true']);
       proc.on('close', (code) => resolve(code === 0));
       proc.on('error', () => resolve(false));
     });
@@ -262,13 +175,13 @@ export class FilesystemSandbox {
    */
   isReadAllowed(path: string): boolean {
     // Check if path is in denied list
-    if (this.config.deniedPaths.some((denied) => path.startsWith(denied))) {
+    if (this.config.deniedPaths.some((denied) => isWithinPath(path, denied))) {
       return false;
     }
 
     // Check if path is in allowed read paths
     return this.config.allowedReadPaths.some((allowed) =>
-      path.startsWith(allowed)
+      isWithinPath(path, allowed)
     );
   }
 
@@ -277,13 +190,13 @@ export class FilesystemSandbox {
    */
   isWriteAllowed(path: string): boolean {
     // Check if path is in denied list
-    if (this.config.deniedPaths.some((denied) => path.startsWith(denied))) {
+    if (this.config.deniedPaths.some((denied) => isWithinPath(path, denied))) {
       return false;
     }
 
     // Check if path is in allowed write paths
     return this.config.allowedWritePaths.some((allowed) =>
-      path.startsWith(allowed)
+      isWithinPath(path, allowed)
     );
   }
 }

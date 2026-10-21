@@ -3,9 +3,10 @@
  */
 
 import { spawn } from 'child_process';
-import { writeFile, unlink } from 'fs/promises';
+import { mkdtemp, writeFile, rm } from 'fs/promises';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { dirname, join } from 'path';
+import { canonicalPath, isWithinPath } from './path-access.js';
 import { SandboxConfig, CommandResult, ExecuteOptions } from './types.js';
 
 export class MacOSSandbox {
@@ -25,7 +26,7 @@ export class MacOSSandbox {
       return result;
     } finally {
       // Clean up profile file
-      await unlink(profilePath).catch(() => {
+      await rm(dirname(profilePath), { recursive: true }).catch(() => {
         // Ignore cleanup errors
       });
     }
@@ -36,8 +37,9 @@ export class MacOSSandbox {
    */
   private async createSandboxProfile(): Promise<string> {
     const profile = this.generateSeatbeltProfile();
-    const profilePath = join(tmpdir(), `sandbox-${Date.now()}.sb`);
-    await writeFile(profilePath, profile, 'utf-8');
+    const directory = await mkdtemp(join(tmpdir(), 'bubblewrap-profile-'));
+    const profilePath = join(directory, 'profile.sb');
+    await writeFile(profilePath, profile, { encoding: 'utf-8', mode: 0o600 });
     return profilePath;
   }
 
@@ -45,59 +47,28 @@ export class MacOSSandbox {
    * Generate Seatbelt sandbox profile
    */
   private generateSeatbeltProfile(): string {
-    const deniedPaths = this.config.deniedPaths
-      .map((path) => path.replace(/^~/, process.env.HOME || ''))
-      .map((path) => `    (subpath "${path}")`)
+    const subpaths = (paths: string[]) => paths
+      .map((path) => `(subpath ${JSON.stringify(canonicalPath(path))})`)
       .join('\n');
-
     return `
 (version 1)
-(debug deny)
-
-; Allow default operations
-(allow default)
-
-; Deny network access (we control this via proxy)
-; Note: sandbox-exec network filtering is limited
-; We rely on the network proxy for actual control
-
-; Deny access to sensitive files and directories
-(deny file-read* file-write*
-${deniedPaths}
-)
-
-; Allow access to working directory
-(allow file-read* file-write*
-  (subpath "${this.config.workingDir}")
-)
-
-; Allow read access to system directories
-(allow file-read*
-  (subpath "/usr")
-  (subpath "/System")
-  (subpath "/Library/Frameworks")
-  (subpath "/Library/Application Support")
-  (literal "/etc/resolv.conf")
-  (literal "/etc/hosts")
-)
-
-; Allow write to tmp
-(allow file-write*
-  (subpath "${this.config.tmpDir}")
-)
-
-; Allow network for our proxy
-(allow network*)
-
-; Allow process execution
-(allow process-exec*)
-(allow process-fork)
-
-; Allow IPC
-(allow ipc*)
-
-; Allow mach lookups (required for system services)
+(deny default)
+(import "system.sb")
+(allow process*)
+(allow sysctl-read)
 (allow mach-lookup)
+(allow ipc*)
+(allow network*)
+(allow signal (target self))
+(allow file-read-metadata)
+(allow file-read* file-map-executable
+${subpaths([...this.config.allowedReadPaths, ...this.config.allowedWritePaths,
+  '/System', '/Library/Frameworks', '/dev/null', '/dev/urandom', '/dev/random'])}
+)
+(allow file-read* file-write*
+${subpaths([...this.config.allowedWritePaths, this.config.tmpDir])}
+)
+${this.config.deniedPaths.length ? `(deny file-read* file-write* ${subpaths(this.config.deniedPaths)})` : ''}
 `;
   }
 
@@ -135,8 +106,8 @@ ${deniedPaths}
         return `'${escaped}'`;
       }).join(' ');
 
-      const wrappedCommand = `${ulimitCommands.join('; ')}; exec ${commandStr}`;
-      return ['sh', '-c', wrappedCommand];
+      const wrappedCommand = `${ulimitCommands.join(' && ')} && exec ${commandStr}`;
+      return ['/bin/bash', '-c', wrappedCommand];
     }
 
     return command;
@@ -201,7 +172,7 @@ ${deniedPaths}
    */
   static async isAvailable(): Promise<boolean> {
     return new Promise((resolve) => {
-      const proc = spawn('which', ['sandbox-exec']);
+      const proc = spawn('sandbox-exec', ['-p', '(version 1)(allow default)', '/usr/bin/true']);
       proc.on('close', (code) => resolve(code === 0));
       proc.on('error', () => resolve(false));
     });
@@ -212,13 +183,13 @@ ${deniedPaths}
    */
   isReadAllowed(path: string): boolean {
     // Check if path is in denied list
-    if (this.config.deniedPaths.some((denied) => path.startsWith(denied))) {
+    if (this.config.deniedPaths.some((denied) => isWithinPath(path, denied))) {
       return false;
     }
 
     // Check if path is in allowed read paths
     return this.config.allowedReadPaths.some((allowed) =>
-      path.startsWith(allowed)
+      isWithinPath(path, allowed)
     );
   }
 
@@ -227,13 +198,13 @@ ${deniedPaths}
    */
   isWriteAllowed(path: string): boolean {
     // Check if path is in denied list
-    if (this.config.deniedPaths.some((denied) => path.startsWith(denied))) {
+    if (this.config.deniedPaths.some((denied) => isWithinPath(path, denied))) {
       return false;
     }
 
     // Check if path is in allowed write paths
     return this.config.allowedWritePaths.some((allowed) =>
-      path.startsWith(allowed)
+      isWithinPath(path, allowed)
     );
   }
 }
